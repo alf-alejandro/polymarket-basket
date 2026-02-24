@@ -11,21 +11,31 @@ Rutas:
 
 import json
 import os
+import redis
 from flask import Flask, jsonify, render_template_string
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-STATE_FILE = os.environ.get("STATE_FILE", "/tmp/state.json")
+REDIS_URL = os.environ.get("REDIS_URL") or os.environ.get("REDIS_PRIVATE_URL")
+_redis_client = None
+
+def get_redis():
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
 
 
 def read_state() -> dict:
+    if not REDIS_URL:
+        return {"error": "REDIS_URL no configurada. Agrega el plugin Redis en Railway."}
     try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"error": "Bot no iniciado aún. Esperando state.json..."}
+        raw = get_redis().get("basket:state")
+        if raw is None:
+            return {"error": "Bot no iniciado aún. Esperando datos del bot..."}
+        return json.loads(raw)
     except Exception as e:
         return {"error": str(e)}
 
