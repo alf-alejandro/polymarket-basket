@@ -332,8 +332,26 @@ async def fetch_all():
 # ═══════════════════════════════════════════════════════
 
 def compute_signals():
-    up_mids = {s: markets[s]["up_mid"] for s in SYMBOLS if markets[s]["up_mid"] > 0}
-    dn_mids = {s: markets[s]["dn_mid"] for s in SYMBOLS if markets[s]["dn_mid"] > 0}
+    # Si un activo ya resolvió (precio >= 0.98 o <= 0.02), lo normalizamos a 1.0 / 0.0
+    # para que cuente correctamente como peer en el armónico y consenso
+    def normalized_up(s):
+        mid = markets[s]["up_mid"]
+        if mid >= RESOLVED_UP_THRESH:
+            return 1.0
+        if mid <= RESOLVED_DN_THRESH:
+            return 0.0
+        return mid
+
+    def normalized_dn(s):
+        mid = markets[s]["dn_mid"]
+        if mid >= RESOLVED_UP_THRESH:
+            return 1.0
+        if mid <= RESOLVED_DN_THRESH:
+            return 0.0
+        return mid
+
+    up_mids = {s: normalized_up(s) for s in SYMBOLS if markets[s]["up_mid"] > 0}
+    dn_mids = {s: normalized_dn(s) for s in SYMBOLS if markets[s]["dn_mid"] > 0}
 
     if len(up_mids) < 2:
         bt["signal_asset"] = None
