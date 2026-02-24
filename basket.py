@@ -27,6 +27,7 @@ from strategy_core import (
     find_active_market,
     get_order_book_metrics,
     seconds_remaining,
+    fetch_market_resolution,
 )
 
 logging.basicConfig(
@@ -86,6 +87,7 @@ bt = {
     "signal_div":   0.0,
     "entry_window": False,
     "position":     None,
+    "pending_resolution": None,   # posición esperando resultado de Gamma
     "traded_this_cycle": False,
     "capital":      CAPITAL_TOTAL,
     "total_pnl":    0.0,
@@ -196,6 +198,7 @@ def write_state():
         "signal_side": bt["signal_side"],
         "signal_div": round(bt["signal_div"], 4),
         "position": bt["position"],
+        "pending_resolution": bt["pending_resolution"],
         "markets": {
             sym: {
                 "up_mid": round(markets[sym]["up_mid"], 4),
@@ -217,47 +220,9 @@ def write_state():
         log.warning(f"write_state error: {e}")
 
 
-def restore_state_from_csv():
-    """Al arrancar, lee el CSV y restaura capital, PnL, wins, losses y trades."""
-    if not os.path.isfile(CSV_FILE):
-        log.info("No hay CSV previo — iniciando desde cero.")
-        return
-
-    try:
-        with open(CSV_FILE, newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-
-        if not rows:
-            return
-
-        last = rows[-1]
-        bt["capital"]      = float(last["capital_after"])
-        bt["total_pnl"]    = float(last["cumulative_pnl"])
-        bt["peak_capital"] = max(CAPITAL_TOTAL, bt["capital"])
-        bt["wins"]         = sum(1 for r in rows if r["outcome"] == "WIN")
-        bt["losses"]       = sum(1 for r in rows if r["outcome"] == "LOSS")
-        bt["trades"]       = [dict(r) for r in rows]
-
-        # Recalcular max drawdown desde el historial
-        peak = CAPITAL_TOTAL
-        for r in rows:
-            cap = float(r["capital_after"])
-            if cap > peak:
-                peak = cap
-            dd = peak - cap
-            if dd > bt["max_drawdown"]:
-                bt["max_drawdown"] = dd
-        bt["peak_capital"] = peak
-
-        total = bt["wins"] + bt["losses"]
-        log.info(f"Estado restaurado desde CSV — {total} trades | "
-                 f"Capital: ${bt['capital']:.4f} | PnL: ${bt['total_pnl']:+.4f} | "
-                 f"W:{bt['wins']} L:{bt['losses']}")
-    except Exception as e:
-        log.warning(f"No se pudo restaurar estado desde CSV: {e}")
-
-
-
+# ═══════════════════════════════════════════════════════
+#  DISCOVERY Y FETCH
+# ═══════════════════════════════════════════════════════
 
 async def discover_all():
     """Descubrir mercados activos para todos los símbolos."""
@@ -423,6 +388,9 @@ def check_entry():
         "consensus_entry": bt["consensus"],
         "peer_snaps":    peer_snaps,
         "capital_before": capital_before,
+        "market_info_snapshot": {
+            "condition_id": markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
+        },
     }
 
     log_event(
@@ -454,26 +422,10 @@ def check_stop_loss():
         write_state()
 
 
-def check_resolution():
-    pos = bt["position"]
-    if not pos:
-        return
+def _apply_resolution(pos, resolved):
+    """Aplica el resultado final a una posición y registra el trade."""
     sym  = pos["asset"]
     side = pos["side"]
-    up_mid = markets[sym]["up_mid"]
-
-    resolved = None
-    if up_mid >= RESOLVED_UP_THRESH:
-        resolved = "UP"
-    elif up_mid <= RESOLVED_DN_THRESH:
-        resolved = "DOWN"
-
-    if not resolved:
-        # También verificar si el mercado expiró (info=None)
-        if markets[sym]["info"] is None and markets[sym]["up_mid"] == 0:
-            return
-        return
-
     if resolved == side:
         pnl     = round((pos["shares"] - 1) * ENTRY_USD, 6)
         outcome = "WIN"
@@ -482,18 +434,100 @@ def check_resolution():
         pnl     = -ENTRY_USD
         outcome = "LOSS"
         bt["losses"] += 1
-
     bt["capital"]   += ENTRY_USD + pnl
     bt["total_pnl"] += pnl
     update_drawdown()
-
     log_event(
         f"RESOLUCIÓN {outcome} {side} {sym} → {resolved} | "
         f"PnL=${pnl:+.4f} | Capital=${bt['capital']:.4f}"
     )
     _record_trade(pos, resolved, outcome, pnl)
-    bt["position"] = None
     write_state()
+
+
+def check_resolution():
+    pos = bt["position"]
+    if not pos:
+        return
+    sym    = pos["asset"]
+    up_mid = markets[sym]["up_mid"]
+
+    # 1. Resolución por precio del order book
+    resolved = None
+    if up_mid >= RESOLVED_UP_THRESH:
+        resolved = "UP"
+    elif up_mid <= RESOLVED_DN_THRESH:
+        resolved = "DOWN"
+
+    if resolved:
+        _apply_resolution(pos, resolved)
+        bt["position"] = None
+        return
+
+    # 2. Mercado expirado sin precio concluyente → pasar a pending
+    if markets[sym]["info"] is None:
+        condition_id = (pos.get("market_info_snapshot") or {}).get("condition_id")
+        if not condition_id:
+            log_event(f"WARN: sin condition_id para {sym}, descartando posición")
+            bt["capital"] += pos["entry_usd"]
+            bt["position"] = None
+            write_state()
+            return
+
+        # Intentar una vez inmediatamente antes de encolar
+        resolved = fetch_market_resolution(condition_id)
+        if resolved:
+            log_event(f"Gamma resolvió {sym} → {resolved} (intento inmediato)")
+            _apply_resolution(pos, resolved)
+            bt["position"] = None
+        else:
+            log_event(f"Gamma aún sin resultado para {sym} — esperando (0/6 intentos)")
+            bt["pending_resolution"] = {
+                "pos":          pos,
+                "condition_id": condition_id,
+                "attempts":     0,
+                "next_check":   time.time() + 300,   # en 5 minutos
+            }
+            bt["position"] = None
+        write_state()
+
+
+async def check_pending_resolution():
+    """
+    Si hay una posición esperando resolución de Gamma,
+    reintenta cada 5 minutos hasta 6 veces.
+    """
+    pr = bt["pending_resolution"]
+    if not pr:
+        return
+    if time.time() < pr["next_check"]:
+        return
+
+    pr["attempts"] += 1
+    condition_id = pr["condition_id"]
+    pos          = pr["pos"]
+    sym          = pos["asset"]
+
+    log_event(f"Consultando Gamma para {sym} — intento {pr['attempts']}/6")
+    loop     = asyncio.get_event_loop()
+    resolved = await loop.run_in_executor(None, fetch_market_resolution, condition_id)
+
+    if resolved:
+        log_event(f"Gamma confirmó {sym} → {resolved} (intento {pr['attempts']})")
+        _apply_resolution(pos, resolved)
+        bt["pending_resolution"] = None
+
+    elif pr["attempts"] >= 6:
+        log_event(f"WARN: Gamma no resolvió {sym} tras 6 intentos — descartando posición, capital devuelto")
+        bt["capital"]   += pos["entry_usd"]
+        bt["total_pnl"] += 0
+        bt["pending_resolution"] = None
+        write_state()
+
+    else:
+        pr["next_check"] = time.time() + 300
+        log_event(f"{sym} aún sin resultado — próximo intento en 5 min ({pr['attempts']}/6)")
+        write_state()
 
 
 # ═══════════════════════════════════════════════════════
@@ -650,6 +684,9 @@ async def main_loop():
 
             await fetch_all()
 
+            # Verificar si hay posición pendiente de resolución por Gamma
+            await check_pending_resolution()
+
             secs = min_secs_remaining()
             bt["entry_window"] = (secs is not None and secs <= ENTRY_WINDOW_SECS)
 
@@ -660,15 +697,12 @@ async def main_loop():
 
             if all(markets[s]["info"] is None for s in SYMBOLS):
                 if bt["position"]:
-                    log_event("Mercado expirado con posicion abierta — resolviendo por ultimo precio...")
+                    log_event("Mercado expirado con posicion abierta — consultando Gamma...")
                     check_resolution()
-                    if bt["position"]:
-                        log_event("WARN: no se pudo determinar resolución, descartando posición")
-                        bt["capital"] += bt["position"]["entry_usd"]
-                        bt["position"] = None
 
-                log_event("Ciclo expirado — buscando nuevo ciclo...")
-                await discover_all()
+                if not bt["pending_resolution"]:
+                    log_event("Ciclo expirado — buscando nuevo ciclo...")
+                    await discover_all()
                 continue
 
             if not bt["position"]:
@@ -682,6 +716,37 @@ async def main_loop():
             write_state()
 
         await asyncio.sleep(POLL_INTERVAL)
+
+
+def restore_state_from_csv():
+    if not os.path.isfile(CSV_FILE):
+        log.info("No hay CSV previo — iniciando desde cero.")
+        return
+    try:
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return
+        last = rows[-1]
+        bt["capital"]      = float(last["capital_after"])
+        bt["total_pnl"]    = float(last["cumulative_pnl"])
+        bt["wins"]         = sum(1 for r in rows if r["outcome"] == "WIN")
+        bt["losses"]       = sum(1 for r in rows if r["outcome"] == "LOSS")
+        bt["trades"]       = [dict(r) for r in rows]
+        peak = CAPITAL_TOTAL
+        for r in rows:
+            cap = float(r["capital_after"])
+            if cap > peak:
+                peak = cap
+            dd = peak - cap
+            if dd > bt["max_drawdown"]:
+                bt["max_drawdown"] = dd
+        bt["peak_capital"] = peak
+        total = bt["wins"] + bt["losses"]
+        log.info(f"Estado restaurado — {total} trades | Capital: ${bt['capital']:.4f} | "
+                 f"PnL: ${bt['total_pnl']:+.4f} | W:{bt['wins']} L:{bt['losses']}")
+    except Exception as e:
+        log.warning(f"No se pudo restaurar estado desde CSV: {e}")
 
 
 # ═══════════════════════════════════════════════════════
