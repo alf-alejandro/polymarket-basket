@@ -132,9 +132,40 @@ def find_active_market(symbol: str) -> dict | None:
     return None
 
 
-def find_active_sol_market() -> dict | None:
-    """Alias para compatibilidad con maker_sim.py original."""
-    return find_active_market("SOL")
+def fetch_market_resolution(condition_id: str) -> str | None:
+    """
+    Consulta Gamma para obtener el resultado final de un mercado cerrado.
+    Retorna 'UP', 'DOWN', o None si aún no está resuelto.
+    """
+    try:
+        r = requests.get(f"{GAMMA_API}/markets/{condition_id}", timeout=8)
+        r.raise_for_status()
+        data = r.json()
+
+        # Gamma indica el resultado en outcomePrices o en los tokens
+        outcome_prices = data.get("outcomePrices")
+        if outcome_prices:
+            try:
+                prices = [float(p) for p in outcome_prices]
+                # outcomePrices[0] = YES/UP, outcomePrices[1] = NO/DOWN
+                if prices[0] >= 0.99:
+                    return "UP"
+                elif prices[1] >= 0.99:
+                    return "DOWN"
+            except Exception:
+                pass
+
+        # Alternativa: campo resolved + winner
+        if data.get("resolved"):
+            winner = (data.get("winner") or "").lower()
+            if "up" in winner:
+                return "UP"
+            elif "down" in winner:
+                return "DOWN"
+
+        return None
+    except Exception:
+        return None
 
 
 def find_active_btc_market() -> dict | None:
