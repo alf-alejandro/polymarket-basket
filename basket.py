@@ -23,8 +23,6 @@ import logging
 from collections import deque
 from datetime import datetime
 
-import redis
-
 from strategy_core import (
     find_active_market,
     get_order_book_metrics,
@@ -59,21 +57,10 @@ RESOLVED_DN_THRESH   = 0.05
 CONSENSUS_FULL       = 0.70
 CONSENSUS_SOFT       = 0.64
 
-# Archivos locales (solo para CSV/log, no compartidos entre servicios)
-LOG_FILE   = os.environ.get("LOG_FILE",   "/tmp/basket_log.json")
-CSV_FILE   = os.environ.get("CSV_FILE",   "/tmp/basket_trades.csv")
-
-# Redis — compartido entre servicios en Railway
-REDIS_URL = os.environ.get("REDIS_URL") or os.environ.get("REDIS_PRIVATE_URL")
-_redis_client = None
-
-def get_redis():
-    global _redis_client
-    if _redis_client is None:
-        if not REDIS_URL:
-            raise RuntimeError("REDIS_URL no configurada. Agrega el plugin Redis en Railway.")
-        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    return _redis_client
+# En Railway el disco no es persistente entre deploys, usamos /tmp
+LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
+CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
+STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 
 # ═══════════════════════════════════════════════════════
 #  ESTADO DE LOS 3 MERCADOS
@@ -182,7 +169,7 @@ def update_drawdown():
 # ═══════════════════════════════════════════════════════
 
 def write_state():
-    """Escribe el estado actual a Redis para que el dashboard lo lea."""
+    """Escribe el estado actual a STATE_FILE para que el dashboard lo lea."""
     total_trades = bt["wins"] + bt["losses"]
     win_rate = (bt["wins"] / total_trades * 100) if total_trades > 0 else 0.0
     roi = (bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100
@@ -224,7 +211,8 @@ def write_state():
         "recent_trades": bt["trades"][-10:],
     }
     try:
-        get_redis().set("basket:state", json.dumps(state), ex=300)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
     except Exception as e:
         log.warning(f"write_state error: {e}")
 
@@ -666,7 +654,7 @@ if __name__ == "__main__":
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
-    log.info(f"State -> Redis:basket:state | Log -> {LOG_FILE}")
+    log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
 
     try:
         asyncio.run(main_loop())
