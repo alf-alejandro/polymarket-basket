@@ -11,13 +11,14 @@ Rutas:
 
 import json
 import os
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, send_file, abort
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
+CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
 
 
 def read_state() -> dict:
@@ -33,6 +34,13 @@ def read_state() -> dict:
 @app.route("/api/state")
 def api_state():
     return jsonify(read_state())
+
+
+@app.route("/download/csv")
+def download_csv():
+    if not os.path.isfile(CSV_FILE):
+        abort(404, description="No hay trades aún. El archivo CSV se crea con el primer trade.")
+    return send_file(CSV_FILE, mimetype="text/csv", as_attachment=True, download_name="basket_trades.csv")
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -254,6 +262,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <h1>⬡ BASKET — DIVERGENCIA ARMÓNICA</h1>
   <div style="display:flex; align-items:center; gap:16px;">
     <span id="last-update">–</span>
+    <a href="/download/csv" style="
+      padding: 5px 14px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      background: #0a1a0a;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      text-decoration: none;
+      font-family: var(--font);
+    ">⬇ CSV</a>
     <span id="phase-badge">–</span>
   </div>
 </header>
