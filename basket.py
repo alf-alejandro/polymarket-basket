@@ -51,8 +51,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
 DIVERGENCE_THRESHOLD = 0.04
-WAKE_UP_SECS         = 80
-ENTRY_WINDOW_SECS    = 80
+WAKE_UP_SECS         = 90
+ENTRY_WINDOW_SECS    = 90
+ENTRY_CLOSE_SECS     = 30   # no entrar en los últimos 30 segundos
 
 CAPITAL_TOTAL        = 100.0
 ENTRY_PCT            = 0.01
@@ -65,6 +66,8 @@ CONSENSUS_FULL       = 0.80
 CONSENSUS_SOFT       = 0.80
 
 ENTRY_MIN_PRICE      = 0.65
+
+STOP_LOSS_PRICE      = 0.33   # SL fijo: se activa si el bid cae a este precio
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
 CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
@@ -454,9 +457,7 @@ def check_stop_loss():
     sym  = pos["asset"]
     side = pos["side"]
     current_bid = markets[sym]["up_bid"] if side == "UP" else markets[sym]["dn_bid"]
-    sl_price = round(2 * pos["entry_price"] - 1.0, 4)
-
-    if current_bid <= sl_price and current_bid > 0:
+    if current_bid <= STOP_LOSS_PRICE and current_bid > 0:
         pnl = round(pos["shares"] * current_bid - ENTRY_USD, 6)
         bt["capital"]   += ENTRY_USD + pnl
         bt["total_pnl"] += pnl
@@ -590,7 +591,7 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
     p1_side_mid, p1_opp_mid = peer_mids(peers[0]) if len(peers) > 0 else (0.0, 0.0)
     p2_side_mid, p2_opp_mid = peer_mids(peers[1]) if len(peers) > 1 else (0.0, 0.0)
 
-    sl_price = round(2 * pos["entry_price"] - 1.0, 4)
+    sl_price = STOP_LOSS_PRICE
     max_win  = round((1.0 - pos["entry_price"]) / pos["entry_price"] * pos["entry_usd"], 6)
 
     binary_win = 1 if outcome == "WIN" and exit_type == "RESOLUTION" else \
@@ -725,7 +726,11 @@ async def main_loop():
             await check_pending_resolution()
 
             secs = min_secs_remaining()
-            bt["entry_window"] = (secs is not None and secs <= ENTRY_WINDOW_SECS)
+            bt["entry_window"] = (
+                secs is not None and
+                secs <= ENTRY_WINDOW_SECS and
+                secs > ENTRY_CLOSE_SECS
+            )
 
             if bt["position"]:
                 check_stop_loss()
