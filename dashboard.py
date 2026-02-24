@@ -39,7 +39,7 @@ def api_state():
 @app.route("/download/csv")
 def download_csv():
     if not os.path.isfile(CSV_FILE):
-        abort(404, description="No hay trades aún. El archivo CSV se crea con el primer trade.")
+        abort(404, description="No hay trades aún.")
     return send_file(CSV_FILE, mimetype="text/csv", as_attachment=True, download_name="basket_trades.csv")
 
 
@@ -263,16 +263,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div style="display:flex; align-items:center; gap:16px;">
     <span id="last-update">–</span>
     <a href="/download/csv" style="
-      padding: 5px 14px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      background: #0a1a0a;
-      color: var(--accent);
-      border: 1px solid var(--accent);
-      text-decoration: none;
-      font-family: var(--font);
+      padding: 5px 14px; border-radius: 4px; font-size: 11px; font-weight: 700;
+      letter-spacing: 0.08em; background: #0a1a0a; color: var(--accent);
+      border: 1px solid var(--accent); text-decoration: none; font-family: var(--font);
     ">⬇ CSV</a>
     <span id="phase-badge">–</span>
   </div>
@@ -446,15 +439,17 @@ function updateMarkets(s) {
     const upArrow  = (isSig && s.signal_side === 'UP')   ? '◀' : '';
     const dnArrow  = (isSig && s.signal_side === 'DOWN')  ? '◀' : '';
     if (m.up_mid > 0) {
+      const upDisplay  = m.up_mid  >= 0.98 ? '1' : m.up_mid  <= 0.02 ? '0' : fmt(m.up_mid,  4);
+      const dnDisplay  = m.dn_mid  >= 0.98 ? '1' : m.dn_mid  <= 0.02 ? '0' : fmt(m.dn_mid,  4);
       html += `<div class="market-row">
         <div class="sym-badge">${sym}</div>
         <div class="price-group">
           <div class="price-label">UP ${upArrow}</div>
-          <div class="price-value up">${fmt(m.up_mid, 4)}</div>
+          <div class="price-value up">${upDisplay}</div>
         </div>
         <div class="price-group">
           <div class="price-label">DOWN ${dnArrow}</div>
-          <div class="price-value down">${fmt(m.dn_mid, 4)}</div>
+          <div class="price-value down">${dnDisplay}</div>
         </div>
         <div class="time-badge">${m.time_left || 'N/A'}</div>
       </div>`;
