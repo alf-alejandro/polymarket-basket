@@ -1,0 +1,5 @@
+requests==2.32.3
+py-clob-client==0.20.0
+flask==3.0.3
+flask-cors==4.0.1
+gunicorn==22.0.0
