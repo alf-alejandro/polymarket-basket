@@ -7,10 +7,15 @@ LOGICA BINARIA CORRECTA:
   Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
   Shares comprados = $1.00 / precio_ask
 
-Modificado para Railway:
-  - Sin render de terminal (sin clear/ANSI)
-  - Escribe estado en STATE_FILE (state.json) cada ciclo para el dashboard
-  - LOG_FILE y CSV_FILE en /tmp (Railway no tiene disco persistente entre deploys)
+CAMBIOS v3:
+  - Rutas en /data (volumen persistente Railway)
+  - Dashboard Flask en hilo secundario (un solo servicio)
+  - restore_state_from_csv() al arrancar
+  - Resolución por Gamma API con reintentos (hasta 6x cada 5min)
+  - CONSENSUS_FULL = 0.80 (ambos peers deben superar 0.80)
+  - Solo entra con consenso FULL
+  - Precio mínimo de entrada 0.65
+  - Umbral de resolución por precio: 0.98 / 0.02
 """
 
 import asyncio
@@ -20,6 +25,7 @@ import time
 import json
 import csv
 import logging
+import threading
 from collections import deque
 from datetime import datetime
 
@@ -27,6 +33,7 @@ from strategy_core import (
     find_active_market,
     get_order_book_metrics,
     seconds_remaining,
+    fetch_market_resolution,
 )
 
 logging.basicConfig(
@@ -54,13 +61,14 @@ ENTRY_USD            = CAPITAL_TOTAL * ENTRY_PCT
 RESOLVED_UP_THRESH   = 0.98
 RESOLVED_DN_THRESH   = 0.02
 
-CONSENSUS_FULL       = 0.70
-CONSENSUS_SOFT       = 0.64
+CONSENSUS_FULL       = 0.80
+CONSENSUS_SOFT       = 0.80
 
-# En Railway el disco no es persistente entre deploys, usamos /tmp
+ENTRY_MIN_PRICE      = 0.65
+
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
-CSV_FILE   = os.environ.get("CSV_FILE",   "/tmp/basket_trades.csv")
-STATE_FILE = os.environ.get("STATE_FILE", "/tmp/state.json")
+CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
+STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 
 # ═══════════════════════════════════════════════════════
 #  ESTADO DE LOS 3 MERCADOS
@@ -86,6 +94,7 @@ bt = {
     "signal_div":   0.0,
     "entry_window": False,
     "position":     None,
+    "pending_resolution": None,
     "traded_this_cycle": False,
     "capital":      CAPITAL_TOTAL,
     "total_pnl":    0.0,
@@ -169,7 +178,6 @@ def update_drawdown():
 # ═══════════════════════════════════════════════════════
 
 def write_state():
-    """Escribe el estado actual a STATE_FILE para que el dashboard lo lea."""
     total_trades = bt["wins"] + bt["losses"]
     win_rate = (bt["wins"] / total_trades * 100) if total_trades > 0 else 0.0
     roi = (bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100
@@ -196,6 +204,7 @@ def write_state():
         "signal_side": bt["signal_side"],
         "signal_div": round(bt["signal_div"], 4),
         "position": bt["position"],
+        "pending_resolution": bt["pending_resolution"],
         "markets": {
             sym: {
                 "up_mid": round(markets[sym]["up_mid"], 4),
@@ -218,11 +227,45 @@ def write_state():
 
 
 # ═══════════════════════════════════════════════════════
+#  RESTAURAR ESTADO DESDE CSV
+# ═══════════════════════════════════════════════════════
+
+def restore_state_from_csv():
+    if not os.path.isfile(CSV_FILE):
+        log.info("No hay CSV previo — iniciando desde cero.")
+        return
+    try:
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return
+        last = rows[-1]
+        bt["capital"]      = float(last["capital_after"])
+        bt["total_pnl"]    = float(last["cumulative_pnl"])
+        bt["wins"]         = sum(1 for r in rows if r["outcome"] == "WIN")
+        bt["losses"]       = sum(1 for r in rows if r["outcome"] == "LOSS")
+        bt["trades"]       = [dict(r) for r in rows]
+        peak = CAPITAL_TOTAL
+        for r in rows:
+            cap = float(r["capital_after"])
+            if cap > peak:
+                peak = cap
+            dd = peak - cap
+            if dd > bt["max_drawdown"]:
+                bt["max_drawdown"] = dd
+        bt["peak_capital"] = peak
+        total = bt["wins"] + bt["losses"]
+        log.info(f"Estado restaurado — {total} trades | Capital: ${bt['capital']:.4f} | "
+                 f"PnL: ${bt['total_pnl']:+.4f} | W:{bt['wins']} L:{bt['losses']}")
+    except Exception as e:
+        log.warning(f"No se pudo restaurar estado desde CSV: {e}")
+
+
+# ═══════════════════════════════════════════════════════
 #  DISCOVERY Y FETCH
 # ═══════════════════════════════════════════════════════
 
 async def discover_all():
-    """Descubrir mercados activos para todos los símbolos."""
     loop = asyncio.get_event_loop()
     for sym in SYMBOLS:
         try:
@@ -298,11 +341,9 @@ def compute_signals():
     bt["harm_up"] = harm_up
     bt["harm_dn"] = harm_dn
 
-    # Buscar divergencia
     cheapest_up, div_up = find_cheapest(up_mids, harm_up)
     cheapest_dn, div_dn = find_cheapest(dn_mids, harm_dn)
 
-    # Elegir la señal más fuerte
     if abs(div_up) >= abs(div_dn) and cheapest_up:
         bt["signal_asset"] = cheapest_up
         bt["signal_side"]  = "UP"
@@ -314,7 +355,6 @@ def compute_signals():
     else:
         bt["signal_asset"] = None
 
-    # Consenso
     if bt["signal_asset"] and bt["signal_side"]:
         peers = [s for s in SYMBOLS if s != bt["signal_asset"]]
         if bt["signal_side"] == "UP":
@@ -335,7 +375,8 @@ def check_entry():
         return
     if not bt["entry_window"]:
         return
-    if bt["consensus"] == "NONE":
+    # Solo entra con consenso FULL (ambos peers > 0.80)
+    if bt["consensus"] != "FULL":
         bt["skipped"] += 1
         return
     if not bt["signal_asset"]:
@@ -356,6 +397,14 @@ def check_entry():
         entry_mid = markets[sym]["dn_mid"]
 
     if entry_ask <= 0 or entry_ask >= 1:
+        return
+
+    # El activo rezagado debe estar sobre ENTRY_MIN_PRICE (0.65)
+    if entry_ask < ENTRY_MIN_PRICE:
+        log_event(
+            f"SKIP {side} {sym} — ask={entry_ask:.4f} bajo mínimo {ENTRY_MIN_PRICE}"
+        )
+        bt["skipped"] += 1
         return
 
     shares = round(ENTRY_USD / entry_ask, 6)
@@ -385,6 +434,9 @@ def check_entry():
         "consensus_entry": bt["consensus"],
         "peer_snaps":    peer_snaps,
         "capital_before": capital_before,
+        "market_info_snapshot": {
+            "condition_id": markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
+        },
     }
 
     log_event(
@@ -416,26 +468,9 @@ def check_stop_loss():
         write_state()
 
 
-def check_resolution():
-    pos = bt["position"]
-    if not pos:
-        return
+def _apply_resolution(pos, resolved):
     sym  = pos["asset"]
     side = pos["side"]
-    up_mid = markets[sym]["up_mid"]
-
-    resolved = None
-    if up_mid >= RESOLVED_UP_THRESH:
-        resolved = "UP"
-    elif up_mid <= RESOLVED_DN_THRESH:
-        resolved = "DOWN"
-
-    if not resolved:
-        # También verificar si el mercado expiró (info=None)
-        if markets[sym]["info"] is None and markets[sym]["up_mid"] == 0:
-            return
-        return
-
     if resolved == side:
         pnl     = round((pos["shares"] - 1) * ENTRY_USD, 6)
         outcome = "WIN"
@@ -444,18 +479,92 @@ def check_resolution():
         pnl     = -ENTRY_USD
         outcome = "LOSS"
         bt["losses"] += 1
-
     bt["capital"]   += ENTRY_USD + pnl
     bt["total_pnl"] += pnl
     update_drawdown()
-
     log_event(
         f"RESOLUCIÓN {outcome} {side} {sym} → {resolved} | "
         f"PnL=${pnl:+.4f} | Capital=${bt['capital']:.4f}"
     )
     _record_trade(pos, resolved, outcome, pnl)
-    bt["position"] = None
     write_state()
+
+
+def check_resolution():
+    pos = bt["position"]
+    if not pos:
+        return
+    sym    = pos["asset"]
+    up_mid = markets[sym]["up_mid"]
+
+    # 1. Resolución por precio (0.98 / 0.02)
+    resolved = None
+    if up_mid >= RESOLVED_UP_THRESH:
+        resolved = "UP"
+    elif up_mid <= RESOLVED_DN_THRESH:
+        resolved = "DOWN"
+
+    if resolved:
+        _apply_resolution(pos, resolved)
+        bt["position"] = None
+        return
+
+    # 2. Mercado expirado sin precio concluyente → consultar Gamma
+    if markets[sym]["info"] is None:
+        condition_id = (pos.get("market_info_snapshot") or {}).get("condition_id")
+        if not condition_id:
+            log_event(f"WARN: sin condition_id para {sym}, descartando posición")
+            bt["capital"] += pos["entry_usd"]
+            bt["position"] = None
+            write_state()
+            return
+
+        resolved = fetch_market_resolution(condition_id)
+        if resolved:
+            log_event(f"Gamma resolvió {sym} → {resolved} (intento inmediato)")
+            _apply_resolution(pos, resolved)
+            bt["position"] = None
+        else:
+            log_event(f"Gamma sin resultado para {sym} — reintentando cada 5min (0/6)")
+            bt["pending_resolution"] = {
+                "pos":          pos,
+                "condition_id": condition_id,
+                "attempts":     0,
+                "next_check":   time.time() + 300,
+            }
+            bt["position"] = None
+        write_state()
+
+
+async def check_pending_resolution():
+    pr = bt["pending_resolution"]
+    if not pr:
+        return
+    if time.time() < pr["next_check"]:
+        return
+
+    pr["attempts"] += 1
+    condition_id = pr["condition_id"]
+    pos          = pr["pos"]
+    sym          = pos["asset"]
+
+    log_event(f"Consultando Gamma para {sym} — intento {pr['attempts']}/6")
+    loop     = asyncio.get_event_loop()
+    resolved = await loop.run_in_executor(None, fetch_market_resolution, condition_id)
+
+    if resolved:
+        log_event(f"Gamma confirmó {sym} → {resolved} (intento {pr['attempts']})")
+        _apply_resolution(pos, resolved)
+        bt["pending_resolution"] = None
+    elif pr["attempts"] >= 6:
+        log_event(f"WARN: Gamma no resolvió {sym} tras 6 intentos — capital devuelto")
+        bt["capital"]   += pos["entry_usd"]
+        bt["pending_resolution"] = None
+        write_state()
+    else:
+        pr["next_check"] = time.time() + 300
+        log_event(f"{sym} sin resultado — próximo intento en 5min ({pr['attempts']}/6)")
+        write_state()
 
 
 # ═══════════════════════════════════════════════════════
@@ -578,6 +687,8 @@ async def main_loop():
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} | Entra en ultimo {ENTRY_WINDOW_SECS}s")
 
+    restore_state_from_csv()
+
     bt["phase"] = "ACTIVO"
     write_state()
     await discover_all()
@@ -610,6 +721,9 @@ async def main_loop():
 
             await fetch_all()
 
+            # Verificar posición pendiente de resolución Gamma
+            await check_pending_resolution()
+
             secs = min_secs_remaining()
             bt["entry_window"] = (secs is not None and secs <= ENTRY_WINDOW_SECS)
 
@@ -620,15 +734,11 @@ async def main_loop():
 
             if all(markets[s]["info"] is None for s in SYMBOLS):
                 if bt["position"]:
-                    log_event("Mercado expirado con posicion abierta — resolviendo por ultimo precio...")
+                    log_event("Mercado expirado con posicion abierta — consultando Gamma...")
                     check_resolution()
-                    if bt["position"]:
-                        log_event("WARN: no se pudo determinar resolución, descartando posición")
-                        bt["capital"] += bt["position"]["entry_usd"]
-                        bt["position"] = None
-
-                log_event("Ciclo expirado — buscando nuevo ciclo...")
-                await discover_all()
+                if not bt["pending_resolution"]:
+                    log_event("Ciclo expirado — buscando nuevo ciclo...")
+                    await discover_all()
                 continue
 
             if not bt["position"]:
@@ -645,6 +755,20 @@ async def main_loop():
 
 
 # ═══════════════════════════════════════════════════════
+#  DASHBOARD EN HILO SECUNDARIO
+# ═══════════════════════════════════════════════════════
+
+def run_dashboard():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dashboard", "dashboard.py")
+    dash = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dash)
+    port = int(os.environ.get("PORT", 5000))
+    log.info(f"Dashboard iniciando en puerto {port}")
+    dash.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
+# ═══════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════
 
@@ -655,6 +779,9 @@ if __name__ == "__main__":
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
+
+    t = threading.Thread(target=run_dashboard, daemon=True)
+    t.start()
 
     try:
         asyncio.run(main_loop())
