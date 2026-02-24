@@ -217,9 +217,47 @@ def write_state():
         log.warning(f"write_state error: {e}")
 
 
-# ═══════════════════════════════════════════════════════
-#  DISCOVERY Y FETCH
-# ═══════════════════════════════════════════════════════
+def restore_state_from_csv():
+    """Al arrancar, lee el CSV y restaura capital, PnL, wins, losses y trades."""
+    if not os.path.isfile(CSV_FILE):
+        log.info("No hay CSV previo — iniciando desde cero.")
+        return
+
+    try:
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        if not rows:
+            return
+
+        last = rows[-1]
+        bt["capital"]      = float(last["capital_after"])
+        bt["total_pnl"]    = float(last["cumulative_pnl"])
+        bt["peak_capital"] = max(CAPITAL_TOTAL, bt["capital"])
+        bt["wins"]         = sum(1 for r in rows if r["outcome"] == "WIN")
+        bt["losses"]       = sum(1 for r in rows if r["outcome"] == "LOSS")
+        bt["trades"]       = [dict(r) for r in rows]
+
+        # Recalcular max drawdown desde el historial
+        peak = CAPITAL_TOTAL
+        for r in rows:
+            cap = float(r["capital_after"])
+            if cap > peak:
+                peak = cap
+            dd = peak - cap
+            if dd > bt["max_drawdown"]:
+                bt["max_drawdown"] = dd
+        bt["peak_capital"] = peak
+
+        total = bt["wins"] + bt["losses"]
+        log.info(f"Estado restaurado desde CSV — {total} trades | "
+                 f"Capital: ${bt['capital']:.4f} | PnL: ${bt['total_pnl']:+.4f} | "
+                 f"W:{bt['wins']} L:{bt['losses']}")
+    except Exception as e:
+        log.warning(f"No se pudo restaurar estado desde CSV: {e}")
+
+
+
 
 async def discover_all():
     """Descubrir mercados activos para todos los símbolos."""
@@ -578,6 +616,8 @@ async def main_loop():
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} | Entra en ultimo {ENTRY_WINDOW_SECS}s")
 
+    restore_state_from_csv()
+
     bt["phase"] = "ACTIVO"
     write_state()
     await discover_all()
@@ -651,9 +691,7 @@ async def main_loop():
 import threading
 
 def run_dashboard():
-    """Lanza el servidor Flask del dashboard en un hilo separado."""
-    import importlib.util, sys as _sys
-    # Importar dashboard dinámicamente para no ensuciar el namespace
+    import importlib.util
     spec = importlib.util.spec_from_file_location("dashboard", "dashboard.py")
     dash = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(dash)
@@ -670,7 +708,6 @@ if __name__ == "__main__":
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
 
-    # Lanzar dashboard en hilo secundario
     t = threading.Thread(target=run_dashboard, daemon=True)
     t.start()
 
