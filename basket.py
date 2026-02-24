@@ -648,6 +648,20 @@ async def main_loop():
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════
 
+import threading
+
+def run_dashboard():
+    """Lanza el servidor Flask del dashboard en un hilo separado."""
+    import importlib.util, sys as _sys
+    # Importar dashboard dinámicamente para no ensuciar el namespace
+    spec = importlib.util.spec_from_file_location("dashboard", "dashboard.py")
+    dash = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dash)
+    port = int(os.environ.get("PORT", 5000))
+    log.info(f"Dashboard iniciando en puerto {port}")
+    dash.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
 if __name__ == "__main__":
     log.info("=" * 54)
     log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]")
@@ -655,6 +669,10 @@ if __name__ == "__main__":
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
+
+    # Lanzar dashboard en hilo secundario
+    t = threading.Thread(target=run_dashboard, daemon=True)
+    t.start()
 
     try:
         asyncio.run(main_loop())
