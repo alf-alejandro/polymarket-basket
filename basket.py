@@ -58,7 +58,7 @@ CONSENSUS_FULL       = 0.70
 CONSENSUS_SOFT       = 0.64
 
 # En Railway el disco no es persistente entre deploys, usamos /tmp
-LOG_FILE   = os.environ.get("LOG_FILE",   "/tmp/basket_log.json")
+LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
 CSV_FILE   = os.environ.get("CSV_FILE",   "/tmp/basket_trades.csv")
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/state.json")
 
