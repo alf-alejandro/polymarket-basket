@@ -305,10 +305,22 @@ async def fetch_one(sym: str):
         if up_metrics and dn_metrics:
             markets[sym]["up_bid"] = up_metrics["best_bid"]
             markets[sym]["up_ask"] = up_metrics["best_ask"]
-            markets[sym]["up_mid"] = round((up_metrics["best_bid"] + up_metrics["best_ask"]) / 2, 4)
             markets[sym]["dn_bid"] = dn_metrics["best_bid"]
             markets[sym]["dn_ask"] = dn_metrics["best_ask"]
-            markets[sym]["dn_mid"] = round((dn_metrics["best_bid"] + dn_metrics["best_ask"]) / 2, 4)
+
+            # Calcular mid correctamente cuando el mercado ya resolvió
+            # (el ask desaparece en el lado ganador y el bid en el perdedor)
+            def calc_mid(bid, ask):
+                if bid > 0 and ask > 0:
+                    return round((bid + ask) / 2, 4)
+                elif bid > 0:
+                    return round(bid, 4)   # solo bid disponible → usar bid
+                elif ask > 0:
+                    return round(ask, 4)   # solo ask disponible → usar ask
+                return 0.0
+
+            markets[sym]["up_mid"] = calc_mid(up_metrics["best_bid"], up_metrics["best_ask"])
+            markets[sym]["dn_mid"] = calc_mid(dn_metrics["best_bid"], dn_metrics["best_ask"])
             secs = seconds_remaining(info)
             if secs is not None:
                 markets[sym]["time_left"] = f"{int(secs)}s"
@@ -418,6 +430,15 @@ def check_entry():
         entry_mid = markets[sym]["dn_mid"]
 
     if entry_ask <= 0 or entry_ask >= 1:
+        return
+
+    # Excluir activos que ya resolvieron — no pueden ser el activo a comprar
+    up_mid = markets[sym]["up_mid"]
+    dn_mid = markets[sym]["dn_mid"]
+    if up_mid >= RESOLVED_UP_THRESH or up_mid <= RESOLVED_DN_THRESH or \
+       dn_mid >= RESOLVED_UP_THRESH or dn_mid <= RESOLVED_DN_THRESH:
+        log_event(f"SKIP {side} {sym} — activo ya resuelto (up={up_mid:.4f} dn={dn_mid:.4f})")
+        bt["skipped"] += 1
         return
 
     # El activo rezagado debe estar sobre ENTRY_MIN_PRICE (0.65)
