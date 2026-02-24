@@ -1,7 +1,0 @@
-[build]
-builder = "nixpacks"
-
-# Este archivo define la config compartida.
-# En Railway creas 2 servicios desde el mismo repo:
-#   Servicio 1 (bot):       start command = python basket.py
-#   Servicio 2 (dashboard): start command = gunicorn dashboard:app --bind 0.0.0.0:$PORT
