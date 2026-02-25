@@ -12,6 +12,12 @@ CAMBIOS v4:
   - DIVERGENCE_THRESHOLD = 0.05 (era 0.04) → gap mínimo 5pts
   - DIVERGENCE_MAX = 0.14 → gap máximo 14pts, descarta divergencias anómalas
   Resultado histórico con estos 3 filtros: WR=80%, PF=2.44, MaxDD=$2.29
+
+CAMBIOS v5:
+  - ELIMINADO Gamma API — ya no se consulta fetch_market_resolution
+  - Resolución fallback: promedio de las últimas 3 muestras CLOB del activo
+  - Si up_mid_avg > 0.5 → UP, si < 0.5 → DOWN, si == 0.5 → LOSS conservador
+  - Cero bloqueos: resolución inmediata al expirar el mercado
 """
 
 import asyncio
@@ -29,7 +35,6 @@ from strategy_core import (
     find_active_market,
     get_order_book_metrics,
     seconds_remaining,
-    fetch_market_resolution,
 )
 
 logging.basicConfig(
@@ -46,12 +51,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 #  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-DIVERGENCE_THRESHOLD = 0.05   # ← v4: era 0.04 — gap mínimo = 5pts
-DIVERGENCE_MAX       = 0.14   # ← v4: NUEVO — gap máximo = 14pts (fuera = mercado roto/anómalo)
+DIVERGENCE_THRESHOLD = 0.05
+DIVERGENCE_MAX       = 0.14
 WAKE_UP_SECS         = 90
-ENTRY_WINDOW_SECS    = 85     # ← v4: techo — no entrar si quedan más de 85s (franja 85-90s era PnL negativo)
-ENTRY_OPEN_SECS      = 60     # ← v4: piso  — no entrar si quedan más de 60s (franja 60-85s es la zona dorada)
-ENTRY_CLOSE_SECS     = 30     # no entrar en los últimos 30 segundos
+ENTRY_WINDOW_SECS    = 85
+ENTRY_OPEN_SECS      = 60
+ENTRY_CLOSE_SECS     = 30
 
 CAPITAL_TOTAL        = 100.0
 ENTRY_PCT            = 0.01
@@ -65,7 +70,10 @@ CONSENSUS_SOFT       = 0.80
 
 ENTRY_MIN_PRICE      = 0.65
 
-STOP_LOSS_PRICE      = 0.33   # SL fijo: se activa si el bid cae a este precio
+STOP_LOSS_PRICE      = 0.33
+
+# Cuántas muestras CLOB guardar por símbolo para el fallback
+MID_HISTORY_SIZE     = 3
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
 CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_trades.csv")
@@ -87,6 +95,11 @@ markets = {
     for s in SYMBOLS
 }
 
+# Historial de up_mid por símbolo — usado para resolución fallback
+mid_history: dict[str, deque] = {
+    s: deque(maxlen=MID_HISTORY_SIZE) for s in SYMBOLS
+}
+
 bt = {
     "harm_up":      0.0,
     "harm_dn":      0.0,
@@ -95,7 +108,7 @@ bt = {
     "signal_div":   0.0,
     "entry_window": False,
     "position":     None,
-    "pending_resolution": None,
+    "pending_resolution": None,   # mantenido por compatibilidad, nunca se usa
     "traded_this_cycle": False,
     "capital":      CAPITAL_TOTAL,
     "total_pnl":    0.0,
@@ -175,6 +188,40 @@ def update_drawdown():
 
 
 # ═══════════════════════════════════════════════════════
+#  RESOLUCIÓN FALLBACK — CLOB (SIN GAMMA)
+# ═══════════════════════════════════════════════════════
+
+def resolve_from_clob_history(sym: str) -> str:
+    """
+    Usa el promedio de las últimas MID_HISTORY_SIZE muestras de up_mid
+    para determinar el ganador cuando el mercado expira sin precio concluyente.
+
+    Regla:
+      avg > 0.5  →  UP ganó
+      avg < 0.5  →  DOWN ganó
+      avg == 0.5 →  LOSS conservador (empate técnico)
+    """
+    history = list(mid_history[sym])
+    if not history:
+        log_event(f"FALLBACK {sym}: sin historial CLOB — asumiendo LOSS")
+        return "_UNKNOWN"
+
+    avg = sum(history) / len(history)
+    log_event(
+        f"FALLBACK {sym}: up_mid_avg={avg:.4f} "
+        f"(últimas {len(history)} muestras: {[round(v,4) for v in history]})"
+    )
+
+    if avg > 0.5:
+        return "UP"
+    elif avg < 0.5:
+        return "DOWN"
+    else:
+        log_event(f"FALLBACK {sym}: empate técnico (avg=0.5) — asumiendo LOSS conservador")
+        return "_UNKNOWN"
+
+
+# ═══════════════════════════════════════════════════════
 #  ESCRITURA DE ESTADO PARA DASHBOARD
 # ═══════════════════════════════════════════════════════
 
@@ -205,7 +252,7 @@ def write_state():
         "signal_side": bt["signal_side"],
         "signal_div": round(bt["signal_div"], 4),
         "position": bt["position"],
-        "pending_resolution": bt["pending_resolution"],
+        "pending_resolution": None,   # siempre None en v5
         "markets": {
             sym: {
                 "up_mid": round(markets[sym]["up_mid"], 4),
@@ -274,6 +321,8 @@ async def discover_all():
             if info:
                 markets[sym]["info"]  = info
                 markets[sym]["error"] = None
+                # Limpiar historial al descubrir ciclo nuevo
+                mid_history[sym].clear()
                 log_event(f"{sym}: mercado encontrado — {info.get('question','')[:50]}")
             else:
                 markets[sym]["info"]  = None
@@ -315,8 +364,14 @@ async def fetch_one(sym: str):
                     return round(ask, 4)
                 return 0.0
 
-            markets[sym]["up_mid"] = calc_mid(up_metrics["best_bid"], up_metrics["best_ask"])
+            up_mid = calc_mid(up_metrics["best_bid"], up_metrics["best_ask"])
+            markets[sym]["up_mid"] = up_mid
             markets[sym]["dn_mid"] = calc_mid(dn_metrics["best_bid"], dn_metrics["best_ask"])
+
+            # ── Acumular historial de up_mid para resolución fallback ──
+            if up_mid > 0:
+                mid_history[sym].append(up_mid)
+
             secs = seconds_remaining(info)
             if secs is not None:
                 markets[sym]["time_left"] = f"{int(secs)}s"
@@ -402,14 +457,12 @@ def check_entry():
         return
     if not bt["entry_window"]:
         return
-    # Solo entra con consenso FULL (ambos peers > 0.80)
     if bt["consensus"] != "FULL":
         bt["skipped"] += 1
         return
     if not bt["signal_asset"]:
         return
 
-    # ── Ventana de divergencia: entre 5pts (THRESHOLD) y 14pts (MAX) ──
     div_abs = abs(bt["signal_div"])
     if div_abs < DIVERGENCE_THRESHOLD:
         return
@@ -436,7 +489,6 @@ def check_entry():
     if entry_ask <= 0 or entry_ask >= 1:
         return
 
-    # Excluir activos que ya resolvieron
     up_mid = markets[sym]["up_mid"]
     dn_mid = markets[sym]["dn_mid"]
     if up_mid >= RESOLVED_UP_THRESH or up_mid <= RESOLVED_DN_THRESH or \
@@ -445,7 +497,6 @@ def check_entry():
         bt["skipped"] += 1
         return
 
-    # El activo rezagado debe estar sobre ENTRY_MIN_PRICE (0.65)
     if entry_ask < ENTRY_MIN_PRICE:
         log_event(
             f"SKIP {side} {sym} — ask={entry_ask:.4f} bajo mínimo {ENTRY_MIN_PRICE}"
@@ -535,13 +586,22 @@ def _apply_resolution(pos, resolved):
 
 
 def check_resolution():
+    """
+    Resolución sin Gamma.
+    Flujo:
+      1. Precio CLOB concluyente (≥0.98 / ≤0.02) → resolución inmediata.
+      2. Mercado expirado (info=None) pero sin precio concluyente →
+         fallback: promedio de las últimas MID_HISTORY_SIZE muestras de up_mid.
+      3. Si el historial está vacío → LOSS conservador + log de advertencia.
+    """
     pos = bt["position"]
     if not pos:
         return
+
     sym    = pos["asset"]
     up_mid = markets[sym]["up_mid"]
 
-    # 1. Resolución por precio (0.98 / 0.02)
+    # 1. Precio concluyente en CLOB
     resolved = None
     if up_mid >= RESOLVED_UP_THRESH:
         resolved = "UP"
@@ -553,61 +613,23 @@ def check_resolution():
         bt["position"] = None
         return
 
-    # 2. Mercado expirado sin precio concluyente → consultar Gamma
+    # 2. Mercado expirado sin precio concluyente → fallback CLOB
     if markets[sym]["info"] is None:
-        condition_id = (pos.get("market_info_snapshot") or {}).get("condition_id")
-        if not condition_id:
-            log_event(f"WARN: sin condition_id para {sym}, descartando posición")
-            bt["capital"] += pos["entry_usd"]
-            bt["position"] = None
-            write_state()
-            return
+        resolved = resolve_from_clob_history(sym)
 
-        resolved = fetch_market_resolution(condition_id)
-        if resolved:
-            log_event(f"Gamma resolvió {sym} → {resolved} (intento inmediato)")
-            _apply_resolution(pos, resolved)
-            bt["position"] = None
+        if resolved == "_UNKNOWN":
+            # Sin historial ni precio — LOSS conservador
+            log_event(f"FALLBACK {sym}: resolución imposible — LOSS conservador")
+            pnl = -ENTRY_USD
+            bt["capital"]   += ENTRY_USD + pnl
+            bt["total_pnl"] += pnl
+            bt["losses"]    += 1
+            update_drawdown()
+            _record_trade(pos, "UNKNOWN", "LOSS", pnl)
         else:
-            log_event(f"Gamma sin resultado para {sym} — reintentando cada 5min (0/6)")
-            bt["pending_resolution"] = {
-                "pos":          pos,
-                "condition_id": condition_id,
-                "attempts":     0,
-                "next_check":   time.time() + 300,
-            }
-            bt["position"] = None
-        write_state()
+            _apply_resolution(pos, resolved)
 
-
-async def check_pending_resolution():
-    pr = bt["pending_resolution"]
-    if not pr:
-        return
-    if time.time() < pr["next_check"]:
-        return
-
-    pr["attempts"] += 1
-    condition_id = pr["condition_id"]
-    pos          = pr["pos"]
-    sym          = pos["asset"]
-
-    log_event(f"Consultando Gamma para {sym} — intento {pr['attempts']}/6")
-    loop     = asyncio.get_event_loop()
-    resolved = await loop.run_in_executor(None, fetch_market_resolution, condition_id)
-
-    if resolved:
-        log_event(f"Gamma confirmó {sym} → {resolved} (intento {pr['attempts']})")
-        _apply_resolution(pos, resolved)
-        bt["pending_resolution"] = None
-    elif pr["attempts"] >= 6:
-        log_event(f"WARN: Gamma no resolvió {sym} tras 6 intentos — capital devuelto")
-        bt["capital"]   += pos["entry_usd"]
-        bt["pending_resolution"] = None
-        write_state()
-    else:
-        pr["next_check"] = time.time() + 300
-        log_event(f"{sym} sin resultado — próximo intento en 5min ({pr['attempts']}/6)")
+        bt["position"] = None
         write_state()
 
 
@@ -727,7 +749,7 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SIMULACION BINARIA")
+    log_event("basket.py iniciado — SIMULACION BINARIA v5 (sin Gamma)")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} ≤{DIVERGENCE_MAX:.0%} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s (zona dorada)")
 
@@ -765,14 +787,12 @@ async def main_loop():
 
             await fetch_all()
 
-            await check_pending_resolution()
-
             secs = min_secs_remaining()
             bt["entry_window"] = (
                 secs is not None and
-                secs <= ENTRY_WINDOW_SECS and  # techo: no entrar con más de 85s
-                secs >= ENTRY_OPEN_SECS        # piso:  no entrar con más de 60s (zona dorada)
-                and secs > ENTRY_CLOSE_SECS    # cierre: no entrar en últimos 30s
+                secs <= ENTRY_WINDOW_SECS and
+                secs >= ENTRY_OPEN_SECS
+                and secs > ENTRY_CLOSE_SECS
             )
 
             if bt["position"]:
@@ -782,9 +802,9 @@ async def main_loop():
 
             if all(markets[s]["info"] is None for s in SYMBOLS):
                 if bt["position"]:
-                    log_event("Mercado expirado con posicion abierta — consultando Gamma...")
+                    log_event("Mercado expirado con posicion abierta — resolviendo con historial CLOB...")
                     check_resolution()
-                if not bt["pending_resolution"]:
+                if not bt["position"]:
                     log_event("Ciclo expirado — buscando nuevo ciclo...")
                     await discover_all()
                 continue
@@ -822,7 +842,7 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v4")
+    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v5")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log.info(f"  Gap: {DIVERGENCE_THRESHOLD*100:.0f}pts — {DIVERGENCE_MAX*100:.0f}pts  |  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
     log.info("  SIMULACION — SIN DINERO REAL")
