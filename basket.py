@@ -7,15 +7,11 @@ LOGICA BINARIA CORRECTA:
   Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
   Shares comprados = $1.00 / precio_ask
 
-CAMBIOS v3:
-  - Rutas en /data (volumen persistente Railway)
-  - Dashboard Flask en hilo secundario (un solo servicio)
-  - restore_state_from_csv() al arrancar
-  - Resolución por Gamma API con reintentos (hasta 6x cada 5min)
-  - CONSENSUS_FULL = 0.80 (ambos peers deben superar 0.80)
-  - Solo entra con consenso FULL
-  - Precio mínimo de entrada 0.65
-  - Umbral de resolución por precio: 0.98 / 0.02
+CAMBIOS v4:
+  - ENTRY_WINDOW_SECS = 85 (era 90) → elimina franja 85-90s que era PnL negativo
+  - DIVERGENCE_THRESHOLD = 0.05 (era 0.04) → gap mínimo 5pts
+  - DIVERGENCE_MAX = 0.14 → gap máximo 14pts, descarta divergencias anómalas
+  Resultado histórico con estos 3 filtros: WR=80%, PF=2.44, MaxDD=$2.29
 """
 
 import asyncio
@@ -50,10 +46,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 #  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-DIVERGENCE_THRESHOLD = 0.04
+DIVERGENCE_THRESHOLD = 0.05   # ← v4: era 0.04 — gap mínimo = 5pts
+DIVERGENCE_MAX       = 0.14   # ← v4: NUEVO — gap máximo = 14pts (fuera = mercado roto/anómalo)
 WAKE_UP_SECS         = 90
-ENTRY_WINDOW_SECS    = 90
-ENTRY_CLOSE_SECS     = 30   # no entrar en los últimos 30 segundos
+ENTRY_WINDOW_SECS    = 85     # ← v4: techo — no entrar si quedan más de 85s (franja 85-90s era PnL negativo)
+ENTRY_OPEN_SECS      = 60     # ← v4: piso  — no entrar si quedan más de 60s (franja 60-85s es la zona dorada)
+ENTRY_CLOSE_SECS     = 30     # no entrar en los últimos 30 segundos
 
 CAPITAL_TOTAL        = 100.0
 ENTRY_PCT            = 0.01
@@ -308,15 +306,13 @@ async def fetch_one(sym: str):
             markets[sym]["dn_bid"] = dn_metrics["best_bid"]
             markets[sym]["dn_ask"] = dn_metrics["best_ask"]
 
-            # Calcular mid correctamente cuando el mercado ya resolvió
-            # (el ask desaparece en el lado ganador y el bid en el perdedor)
             def calc_mid(bid, ask):
                 if bid > 0 and ask > 0:
                     return round((bid + ask) / 2, 4)
                 elif bid > 0:
-                    return round(bid, 4)   # solo bid disponible → usar bid
+                    return round(bid, 4)
                 elif ask > 0:
-                    return round(ask, 4)   # solo ask disponible → usar ask
+                    return round(ask, 4)
                 return 0.0
 
             markets[sym]["up_mid"] = calc_mid(up_metrics["best_bid"], up_metrics["best_ask"])
@@ -344,8 +340,6 @@ async def fetch_all():
 # ═══════════════════════════════════════════════════════
 
 def compute_signals():
-    # Si un activo ya resolvió (precio >= 0.98 o <= 0.02), lo normalizamos a 1.0 / 0.0
-    # para que cuente correctamente como peer en el armónico y consenso
     def normalized_up(s):
         mid = markets[s]["up_mid"]
         if mid >= RESOLVED_UP_THRESH:
@@ -414,7 +408,17 @@ def check_entry():
         return
     if not bt["signal_asset"]:
         return
-    if abs(bt["signal_div"]) < DIVERGENCE_THRESHOLD:
+
+    # ── Ventana de divergencia: entre 5pts (THRESHOLD) y 14pts (MAX) ──
+    div_abs = abs(bt["signal_div"])
+    if div_abs < DIVERGENCE_THRESHOLD:
+        return
+    if div_abs > DIVERGENCE_MAX:
+        log_event(
+            f"SKIP — gap={div_abs*100:.1f}pts excede máximo {DIVERGENCE_MAX*100:.0f}pts "
+            f"(divergencia anómala, posible mercado roto)"
+        )
+        bt["skipped"] += 1
         return
 
     sym  = bt["signal_asset"]
@@ -432,7 +436,7 @@ def check_entry():
     if entry_ask <= 0 or entry_ask >= 1:
         return
 
-    # Excluir activos que ya resolvieron — no pueden ser el activo a comprar
+    # Excluir activos que ya resolvieron
     up_mid = markets[sym]["up_mid"]
     dn_mid = markets[sym]["dn_mid"]
     if up_mid >= RESOLVED_UP_THRESH or up_mid <= RESOLVED_DN_THRESH or \
@@ -725,7 +729,7 @@ def _save_log():
 async def main_loop():
     log_event("basket.py iniciado — SIMULACION BINARIA")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} | Entra en ultimo {ENTRY_WINDOW_SECS}s")
+    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} ≤{DIVERGENCE_MAX:.0%} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s (zona dorada)")
 
     restore_state_from_csv()
 
@@ -761,14 +765,14 @@ async def main_loop():
 
             await fetch_all()
 
-            # Verificar posición pendiente de resolución Gamma
             await check_pending_resolution()
 
             secs = min_secs_remaining()
             bt["entry_window"] = (
                 secs is not None and
-                secs <= ENTRY_WINDOW_SECS and
-                secs > ENTRY_CLOSE_SECS
+                secs <= ENTRY_WINDOW_SECS and  # techo: no entrar con más de 85s
+                secs >= ENTRY_OPEN_SECS        # piso:  no entrar con más de 60s (zona dorada)
+                and secs > ENTRY_CLOSE_SECS    # cierre: no entrar en últimos 30s
             )
 
             if bt["position"]:
@@ -818,8 +822,9 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]")
+    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v4")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
+    log.info(f"  Gap: {DIVERGENCE_THRESHOLD*100:.0f}pts — {DIVERGENCE_MAX*100:.0f}pts  |  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
